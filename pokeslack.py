@@ -21,10 +21,12 @@ import pokemon_pb2
 import time
 import httplib
 import urllib
+import types
+import numpy as np
 from google.protobuf.internal import encoder
 from google.protobuf.message import DecodeError
 from s2sphere import *
-from datetime import datetime
+from datetime import datetime, timedelta
 from geopy.geocoders import GoogleV3
 from gpsoauth import perform_master_login, perform_oauth
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError
@@ -33,7 +35,7 @@ from requests.adapters import ConnectionError
 from requests.models import InvalidURL
 from transform import *
 from math import radians, cos, sin, asin, sqrt
-
+from argparse import Namespace
 
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
@@ -84,21 +86,53 @@ origin_lat, origin_lon = None, None
 is_ampm_clock = False
 
 spotted_pokemon = {}
+max_idle_time = timedelta(seconds=300)
+api_last_response = datetime.now()
+wait_to_reconnect = 60
+first_connection = True
+api_endpoint = None
+access_token = None
+profile_response = None
 
 # stuff for in-background search thread
 
 search_thread = None
 
-def memoize(obj):
-    cache = obj.cache = {}
 
-    @functools.wraps(obj)
-    def memoizer(*args, **kwargs):
-        key = str(args) + str(kwargs)
-        if key not in cache:
-            cache[key] = obj(*args, **kwargs)
-        return cache[key]
-    return memoizer
+class memoized(object):
+    """Decorator that caches a function's return value each time it is called.
+    If called later with the same arguments, the cached value is returned, and
+    not re-evaluated.
+    """
+
+    def __init__(self, func):
+        self.func = func
+        self.cache = {}
+
+    def __call__(self, *args):
+        try:
+            return self.cache[args]
+        except KeyError:
+            value = self.func(*args)
+            self.cache[args] = value
+            return value
+        except TypeError:
+            # uncachable -- for instance, passing a list as an argument.
+            # Better to not cache than to blow up entirely.
+            return self.func(*args)
+
+    def __repr__(self):
+        """Return the function's docstring."""
+        return self.func.__doc__
+
+    def __get__(self, obj, objtype):
+        """Support instance methods."""
+        fn = functools.partial(self.__call__, obj)
+        fn.reset = self._reset
+        return fn
+
+    def _reset(self):
+        self.cache = {}
 
 def parse_unicode(bytestring):
     decoded_string = bytestring.decode(sys.getfilesystemencoding())
@@ -217,6 +251,27 @@ def h2f(hex):
     return struct.unpack('<d', struct.pack('<Q', int(hex, 16)))[0]
 
 
+def strtr(s, repl):
+  pattern = '|'.join(map(re.escape, sorted(repl, key=len, reverse=True)))
+  return re.sub(pattern, lambda m: repl[m.group()], s)
+
+
+def merge(x,y):
+    # store a copy of x, but overwrite with y's values where applicable
+    merged = dict(x,**y)
+
+    xkeys = x.keys()
+
+    # if the value of merged[key] was overwritten with y[key]'s value
+    # then we need to put back any missing x[key] values
+    for key in xkeys:
+        # if this key is a dictionary, recurse
+        if type(x[key]) is types.DictType and y.has_key(key):
+            merged[key] = merge(x[key],y[key])
+
+    return merged
+
+
 def retrying_set_location(location_name):
     """
     Continue trying to get co-ords from Google Location until we have them
@@ -326,35 +381,48 @@ def api_req(service, api_endpoint, access_token, *args, **kwargs):
 
 def get_api_endpoint(service, access_token, api=API_URL):
     profile_response = None
-    while not profile_response:
+    attempt_get_api_endpoint = 1
+    while not profile_response and attempt_get_api_endpoint <= 5:
         profile_response = retrying_get_profile(service, access_token, api,
                                                 None)
         if not hasattr(profile_response, 'api_url'):
             debug(
-                'retrying_get_profile: get_profile returned no api_url, retrying')
+                'get_api_endpoint: retrying_get_profile: get_profile returned no api_url, retrying '
+                + str(attempt_get_api_endpoint))
             profile_response = None
+            attempt_get_api_endpoint += 1
             continue
         if not len(profile_response.api_url):
             debug(
-                'get_api_endpoint: retrying_get_profile returned no-len api_url, retrying')
+                'get_api_endpoint: retrying_get_profile returned no-len api_url, retrying'
+                + str(attempt_get_api_endpoint))
             profile_response = None
+            attempt_get_api_endpoint += 1
 
-    return 'https://%s/rpc' % profile_response.api_url
+    if profile_response:
+        api_endpoint = 'https://%s/rpc' % profile_response.api_url
+    else:
+        api_endpoint = None
+
+    return api_endpoint
 
 def retrying_get_profile(service, access_token, api, useauth, *reqq):
     profile_response = None
-    while not profile_response:
+    attempt_get_profile = 1
+    while not profile_response and attempt_get_profile <= 5:
         profile_response = get_profile(service, access_token, api, useauth,
                                        *reqq)
         if not hasattr(profile_response, 'payload'):
             debug(
-                'retrying_get_profile: get_profile returned no payload, retrying')
+                'retrying_get_profile: get_profile returned no payload, retrying ' + str(attempt_get_profile))
             profile_response = None
+            attempt_get_profile += 1
             continue
         if not profile_response.payload:
             debug(
-                'retrying_get_profile: get_profile returned no-len payload, retrying')
+                'retrying_get_profile: get_profile returned no-len payload, retrying ' + str(attempt_get_profile))
             profile_response = None
+            attempt_get_profile += 1
 
     return profile_response
 
@@ -496,7 +564,7 @@ def get_token(service, username, password):
     """
 
     global global_token
-    if global_token is None:
+    if True:  # global_token is None:
         if service == 'ptc':
             global_token = login_ptc(username, password)
         else:
@@ -520,9 +588,9 @@ def send_to_slack(text, username, icon_emoji, webhook):
 
     h.request('POST', webhook, data, headers)
     r = h.getresponse()
-    ack = r.read()
-    #print data
-    #print ack
+    # ack = r.read()
+    # print data
+    # print ack
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -580,6 +648,11 @@ def get_args():
         help="Locale for Pokemon names: default en, check locale folder for more options",
         default="en")
     parser.add_argument(
+        "-iL",
+        "--icon-locale",
+        help="Locale for Pokemon icons: default en, check locale folder for more options",
+        default="en")
+    parser.add_argument(
         "-ol",
         "--onlylure",
         help='Display only lured pokéstop',
@@ -600,49 +673,57 @@ def get_args():
     parser.set_defaults(DEBUG=True)
     return parser.parse_args()
 
-@memoize
-def login(args):
-    global global_password
-    if not global_password:
-      if args.password:
-        global_password = args.password
-      else:
-        global_password = getpass.getpass()
+class connection:
+    @memoized
+    def login(self, args):
+        global global_password
+        if not global_password:
+          if args.password:
+            global_password = args.password
+          else:
+            global_password = getpass.getpass()
 
-    access_token = get_token(args.auth_service, args.username, global_password)
-    if access_token is None:
-        raise Exception('[-] Wrong username/password')
+        profile_response = None
+        while profile_response is None or not profile_response.payload:
+            access_token = get_token(args.auth_service, args.username, global_password)
+            if access_token is None:
+                print '[-] access_token is None: wrong username/password?'
+                time.sleep(wait_to_reconnect)
+                continue
 
-    print '[+] RPC Session Token: {} ...'.format(access_token[:25])
+            print '[+] RPC Session Token: {} ...'.format(access_token[:25])
 
-    api_endpoint = get_api_endpoint(args.auth_service, access_token)
-    if api_endpoint is None:
-        raise Exception('[-] RPC server offline')
+            api_endpoint = get_api_endpoint(args.auth_service, access_token)
+            if api_endpoint is None:
+                print '[-] No response from RPC server'
+                time.sleep(wait_to_reconnect)
+                continue
 
-    print '[+] Received API endpoint: {}'.format(api_endpoint)
+            print '[+] Received API endpoint: {}'.format(api_endpoint)
 
-    profile_response = retrying_get_profile(args.auth_service, access_token,
-                                            api_endpoint, None)
-    if profile_response is None or not profile_response.payload:
-        raise Exception('Could not get profile')
+            profile_response = retrying_get_profile(args.auth_service, access_token,
+                                                    api_endpoint, None)
+            if profile_response is None or not profile_response.payload:
+                print 'Could not get profile, retrying connecting'
+                time.sleep(wait_to_reconnect)
 
-    print '[+] Login successful'
+        print '[+] Login successful'
 
-    payload = profile_response.payload[0]
-    profile = pokemon_pb2.ResponseEnvelop.ProfilePayload()
-    profile.ParseFromString(payload)
-    print '[+] Username: {}'.format(profile.profile.username)
+        payload = profile_response.payload[0]
+        profile = pokemon_pb2.ResponseEnvelop.ProfilePayload()
+        profile.ParseFromString(payload)
+        print '[+] Username: {}'.format(profile.profile.username)
 
-    creation_time = \
-        datetime.fromtimestamp(int(profile.profile.creation_time)
-                               / 1000)
-    print '[+] You started playing Pokemon Go on: {}'.format(
-        creation_time.strftime('%Y-%m-%d %H:%M:%S'))
+        creation_time = \
+            datetime.fromtimestamp(int(profile.profile.creation_time)
+                                   / 1000)
+        print '[+] You started playing Pokemon Go on: {}'.format(
+            creation_time.strftime('%Y-%m-%d %H:%M:%S'))
 
-    for curr in profile.profile.currency:
-        print '[+] {}: {}'.format(curr.type, curr.amount)
+        for curr in profile.profile.currency:
+            print '[+] {}: {}'.format(curr.type, curr.amount)
 
-    return api_endpoint, access_token, profile_response
+        return api_endpoint, access_token, profile_response
 
 def main():
     full_path = os.path.realpath(__file__)
@@ -654,9 +735,19 @@ def main():
         print '[!] Invalid Auth service specified'
         return
 
-    print('[+] Locale is ' + args.locale)
+    print('[+] Locale is ' + args.locale + ' and icon locale is ' + args.icon_locale)
     pokemonsJSON = json.load(
         codecs.open(path + '/locales/pokemon.' + args.locale + '.json', "r", 'UTF-8'))
+
+    pokemonsJSON_icons = json.load(
+        codecs.open(path + '/locales/pokemon.' + args.icon_locale + '.json', "r", 'UTF-8'))
+
+    translationsJSON = json.load(
+        codecs.open(path + '/locales/translations.en.json', "r", 'UTF-8'))
+    if os.path.isfile(path + '/locales/translations.' + args.locale + '.json'):
+        overrideTranslationsJSON = json.load(
+            codecs.open(path + '/locales/translations.' + args.locale + '.json', "r", 'UTF-8'));
+        translationsJSON = merge(translationsJSON, overrideTranslationsJSON)
 
     if args.debug:
         global DEBUG
@@ -676,7 +767,19 @@ def main():
     	global is_ampm_clock
     	is_ampm_clock = True
 
-    api_endpoint, access_token, profile_response = login(args)
+    global api_last_response, first_connection, api_endpoint, access_token, profile_response
+
+    if first_connection:
+        print '[+] Connecting'
+        api_endpoint, access_token, profile_response = connection.login(args)
+        api_last_response = datetime.now()
+        first_connection = False
+    elif datetime.now() - api_last_response > max_idle_time and args.auth_service == 'google':
+        print '[!] Resetting connection...'
+        connection.login.reset()
+        time.sleep(wait_to_reconnect)
+        api_endpoint, access_token, profile_response = connection.login(args)
+        api_last_response = datetime.now()
 
     clear_stale_pokemons()
 
@@ -720,7 +823,8 @@ def main():
         (x, y) = (x + dx, y + dy)
 
         process_step(args, api_endpoint, access_token, profile_response,
-                     pokemonsJSON, ignore, only)
+                     pokemonsJSON, pokemonsJSON_icons, translationsJSON, ignore, only)
+
 
         print('Completed: ' + str(
             ((step+1) + pos * .25 - .25) / (steplimit2) * 100) + '%')
@@ -739,7 +843,8 @@ def main():
 
 
 def process_step(args, api_endpoint, access_token, profile_response,
-                 pokemonsJSON, ignore, only):
+                 pokemonsJSON, pokemonsJSON_icons, translationsJSON, ignore, only):
+
     print('[+] Searching for Pokemon at location {} {}'.format(FLOAT_LAT, FLOAT_LONG))
     origin = LatLng.from_degrees(FLOAT_LAT, FLOAT_LONG)
     step_lat = FLOAT_LAT
@@ -764,10 +869,14 @@ def process_step(args, api_endpoint, access_token, profile_response,
         try:
             for cell in hh.cells:
                 for wild in cell.WildPokemon:
-                    hash = wild.SpawnPointId;
-                    if hash not in seen.keys() or (seen[hash].TimeTillHiddenMs <= wild.TimeTillHiddenMs):
+                    hash = wild.SpawnPointId
+                    disappear_timestamp = time.time() + wild.TimeTillHiddenMs / 1000
+                    if hash not in seen.keys() or \
+                                    wild.pokemon.PokemonId != seen[hash]['PokemonId'] \
+                                    or seen[hash]['disappear_timestamp'] < disappear_timestamp - 300:
                         visible.append(wild)
-                    seen[hash] = wild.TimeTillHiddenMs
+                        seen[hash] = {'disappear_timestamp': disappear_timestamp,
+                                                              'PokemonId': wild.pokemon.PokemonId}
                 if cell.Fort:
                     for Fort in cell.Fort:
                         if Fort.Enabled == True:
@@ -778,14 +887,31 @@ transform_from_wgs_to_gcj(Location(Fort.Latitude, Fort.Longitude))
                                 gyms[Fort.FortId] = [Fort.Team, Fort.Latitude,
                                                      Fort.Longitude, Fort.GymPoints]
 
-                            elif Fort.FortType \
-                                and args.display_pokestop:
+                            elif Fort.FortType:
                                 expire_time = 0
                                 if Fort.LureInfo.LureExpiresTimestampMs:
+                                    if Fort.LureInfo.ActivePokemonId:
+                                        hash = Fort.LureInfo.FortId
+                                        disappear_timestamp = Fort.LureInfo.LureExpiresTimestampMs / 1000
+                                        if hash not in seen.keys() \
+                                                or Fort.LureInfo.ActivePokemonId != seen[hash].PokemonId \
+                                                or seen[hash].disappear_timestamp < disappear_timestamp - 300:
+                                            lured = Namespace()
+                                            lured.lured = True
+                                            lured.pokemon = Namespace()
+                                            lured.pokemon.PokemonId = Fort.LureInfo.ActivePokemonId
+                                            lured.Latitude = Fort.Latitude + 0.00007 * np.random.normal()
+                                            lured.Longitude = Fort.Longitude + 0.00007 * np.random.normal()
+                                            lured.SpawnPointId = 'Fort_' + Fort.LureInfo.FortId
+                                            lured.TimeTillHiddenMs = Fort.LureInfo.LureExpiresTimestampMs - \
+                                                time.time() * 1000
+                                            visible.append(lured)
+                                            seen[hash] = {'disappear_timestamp': disappear_timestamp,
+                                                          'PokemonId': Fort.LureInfo.ActivePokemonId}
                                     expire_time = datetime\
                                         .fromtimestamp(Fort.LureInfo.LureExpiresTimestampMs / 1000.0)\
                                         .strftime("%H:%M:%S")
-                                if (expire_time != 0 or not args.onlylure):
+                                if args.display_pokestop and (expire_time != 0 or not args.onlylure):
                                     pokestops[Fort.FortId] = [Fort.Latitude,
                                                               Fort.Longitude, expire_time]
         except AttributeError:
@@ -794,6 +920,8 @@ transform_from_wgs_to_gcj(Location(Fort.Latitude, Fort.Longitude))
     for poke in visible:
         pokeid = str(poke.pokemon.PokemonId)
         pokename = pokemonsJSON[pokeid]
+        pokename_icon = pokemonsJSON_icons[pokeid]
+        disappear_timestamp = time.time() + poke.TimeTillHiddenMs / 1000
         if args.ignore:
             if pokename.lower() in ignore or pokeid in ignore:
                 continue
@@ -805,9 +933,6 @@ transform_from_wgs_to_gcj(Location(Fort.Latitude, Fort.Longitude))
                 continue
         if poke.TimeTillHiddenMs < 0:
             continue
-
-        disappear_timestamp = time.time() + poke.TimeTillHiddenMs \
-            / 1000
 
         if args.china:
             (poke.Latitude, poke.Longitude) = \
@@ -825,30 +950,41 @@ transform_from_wgs_to_gcj(Location(Fort.Latitude, Fort.Longitude))
             disappear_seconds = str(disappear_seconds)
             if len(disappear_seconds) == 1:
                 disappear_seconds = str(0) + disappear_seconds
-            disappear_time = disappear_datetime.strftime("%H:%M:%S")
+            disappear_time = disappear_datetime.strftime(translationsJSON['time_format'])
 
             # calculate direction of Pokemon in bearing degrees
             direction = bearing_degrees(origin_lat, origin_lon, poke.Latitude, poke.Longitude)
             # transform in compass direction
             direction = bearing_degrees_to_compass_direction(direction)
 
-            alert_text = 'I\'m just <https://pokevision.com/#/@' + str(poke.Latitude) + ',' + str(poke.Longitude) + \
-                         '|' + "{0:.2f}".format(distance) + \
-                         ' m> ' + direction + ' until ' + disappear_time + \
-                         ' (' + disappear_minutes + ':' + disappear_seconds + ')!'
+            alert_text = strtr(translationsJSON['spotted_pokemon'], {
+                '#{latitude}': str(poke.Latitude),
+                '#{longitude}': str(poke.Longitude),
+                '#{distance}': "{0:.2f}".format(distance),
+                '#{direction}': translationsJSON['directions'][direction],
+                '#{disappear_time}': disappear_time,
+                '#{disappear_minutes}': disappear_minutes,
+                '#{disappear_seconds}': disappear_seconds})
 
             if pokemon_icons_prefix != ':pokeball:':
-                user_icon = pokemon_icons_prefix + pokename.lower() + ':'
+                user_icon = pokemon_icons_prefix + pokename_icon.lower() + ':'
             else:
                 user_icon = ':pokeball:'
 
-
-
-            send_to_slack(alert_text, pokename, user_icon, slack_webhook_urlpath)
+            try:
+                if poke.lured:
+                    send_to_slack(alert_text, pokename + ' (lured)', user_icon, slack_webhook_urlpath)
+                else:
+                    send_to_slack(alert_text, pokename, user_icon, slack_webhook_urlpath)
+            except:
+                send_to_slack(alert_text, pokename, user_icon, slack_webhook_urlpath)
 
             spotted_pokemon[poke.SpawnPointId] = {'disappear_datetime': disappear_datetime, 'pokename': pokename}
 
         # print(r.status_code, r.reason)
+
+        global api_last_response
+        api_last_response = datetime.now()
 
         pokemons[poke.SpawnPointId] = {
             "lat": poke.Latitude,
